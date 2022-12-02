@@ -1,0 +1,332 @@
+---
+title: "preprocess_dataframes"
+output: html_notebook
+---
+
+Returns clean dataframes (after excluding sentences that are mismatched between models/humans) for:
+- sentence set
+- human judgments
+- model + human.mean score
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls()) 
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+source('dataloader_utils.R') #includes read_data function
+savedir <- paste("clean_data")
+if (!dir.exists(savedir)) {dir.create(savedir)}
+```
+
+```{r}
+experiment = "EventsRev" # can be "EventsAdapt" or "EventsRev" or "DTFit"
+normalization_type = "min-max" #can be "min-max", "zscore", "none"
+```
+
+```{r}
+normalization <- get_normalization_fn(normalization_type)
+```
+
+# Read sentence freq data
+
+```{r}
+dirname = '../sentence_info'
+sentence_file = paste(dirname, paste(experiment, 'freqs.csv', sep='_'), sep='/')
+
+# read in & normalize predictors
+dat.sentence = read.csv(sentence_file) %>%
+  mutate(agent_freq_norm = (agent_freq - mean(agent_freq))/sd(agent_freq),
+         patient_freq_norm = (patient_freq - mean(patient_freq))/sd(patient_freq),
+         verb_freq_norm = (verb_freq - mean(verb_freq))/sd(verb_freq),
+         sentence_freq_norm = (sentence_freq - mean(sentence_freq))/sd(sentence_freq))
+if (experiment=='EventsRev') {
+  dat.sentence$TrialType = 'AAN'         
+  dat.sentence$Voice = 'active'
+} else if (experiment=='DTFit') {
+  dat.sentence$TrialType = 'DTFit'         
+  dat.sentence$Voice = 'active'
+  dat.sentence = dat.sentence %>% 
+    rename(Plausibility=Typicality) %>%
+    select(-Rating)
+}
+
+dat.sentence$Plausibility = recode(dat.sentence$Plausibility, 
+                             implausible='Implausible', plausible='Plausible',
+                             implaus="Implausible", plaus="Plausible",
+                             AT='Implausible', T='Plausible') 
+dat.sentence$Experiment = experiment
+```
+
+```{r}
+# randomly assign plausibility values to AAR, use even/odd heuristic for the rest
+if (experiment=='EventsAdapt'){
+  dat.sentence$Index = c(1:nrow(dat.sentence))
+  dat.sentence = dat.sentence %>%
+    mutate(Plausibility = ifelse((Index%%2==0), 'Implausible', 'Plausible')) %>%
+    select(-Index)
+}
+```
+
+## Add synonym info
+```{r}
+if (experiment=='EventsAdapt'){
+  dat.synonyms = read.csv("../sentence_info/EventsAdapt_synonyms.csv")
+  synonym_info = merge(dat.sentence, dat.synonyms) %>% select(ItemNum, SynonymPair, NumSyn)
+  dat.sentence = merge(dat.sentence, synonym_info, all=T)
+}
+```
+
+# Read human data
+
+```{r}
+# READ
+dirname = '../beh-ratings-events'
+filename = ifelse(experiment=='DTFit', 'newformat_curated_human_ratings.csv', 
+                  'analyses/longform_data.csv')
+ratings_file = paste(dirname, experiment, filename, sep='/')
+
+dat.human = read.csv(ratings_file) %>% 
+  rename(ItemNum=Item)
+
+if (experiment=='EventsRev') {
+  dat.human = dat.human %>%
+    rename(Score=Answer.Rating) %>%
+    rename(Sentence=Input.trial) %>%
+    select(WorkerId, Score, Plausibility, ItemNum, Sentence) %>%
+    filter(ItemNum<41)    # exclude attention checks
+} else if (experiment=='EventsAdapt') {
+    dat.human = dat.human %>%
+      rename(Score=Answer.Rating) %>%
+      rename(Sentence=Input.trial) %>%
+      select(WorkerId, Score, Plausibility, ItemNum, Sentence, TrialType, Voice)
+} else {
+  dat.human = dat.human %>% rename(Score=Rating, Plausibility=Typicality)
+}
+
+# CLEAN
+dat.human$Plausibility = recode(dat.human$Plausibility, 
+                             implausible='Implausible', plausible='Plausible',
+                             implaus="Implausible", plaus="Plausible",
+                             plausible0='Implausible', plausible1='Plausible',
+                             AT='Implausible', T='Plausible',
+                             Atypical='Implausible', Typical='Plausible') 
+
+# fix a typo (the assumption is that it doesn't change the rating)
+if (experiment=='EventsRev') {
+  dat.human = dat.human %>%
+    mutate(Sentence=replace(Sentence, Sentence=="The journalist is interviewng the sportsstar.",
+                             "The journalist is interviewing the sportsstar."))
+}
+```
+
+## Get the human mean score (to compare w models)
+
+```{r, echo=FALSE}
+dat.human.mean = dat.human %>% 
+  group_by(ItemNum, Sentence, Plausibility) %>%
+  summarize(MeanScore = mean(Score, na.rm=TRUE)) %>%
+  ungroup() 
+dat.human.mean$ItemNum = as.factor(dat.human.mean$ItemNum)
+
+#scale scores and add NA column for token number (to match models)
+dat.human.mean = dat.human.mean %>%
+  mutate(NormScore = normalization(MeanScore),
+         NumTokens = NA)
+```
+
+# Read model scores
+```{r, echo=FALSE}
+dirname = paste('..', 'model_scores', experiment, sep='/')
+
+message(paste('Loading', experiment, 'model data ...'))
+filenames = list.files(path=dirname, pattern='*.txt')
+dat.models = do.call(rbind, lapply(filenames, function(x) read_data(dirname, x, normalization)))
+
+# CLEAN
+dat.models$Plausibility = recode(dat.models$Plausibility, 
+                             implausible='Implausible', plausible='Plausible',
+                             implaus="Implausible", plaus="Plausible",
+                             plausible0='Implausible', plausible1='Plausible',
+                             AT='Implausible', T='Plausible',
+                             Atypical='Implausible', Typical='Plausible') 
+```
+
+## Add human data
+
+```{r}
+# check that sentences match & exclude items where they don't
+shared_sentences = intersect(unique(dat.models$Sentence), unique(dat.human.mean$Sentence))
+
+if (any(sapply(dat.models$Sentence, function(x) {!(x %in% shared_sentences)}))) {
+  excluded = dat.models %>% filter(!(Sentence %in% shared_sentences)) %>%
+    select(ItemNum, Sentence) %>% distinct()
+  warning('Not all model sentences are in the human data file. Excluding these sentences and their plausibility/active-passive pairs:\n') 
+  warning(paste(excluded$Sentence, '\n'))
+  dat.models = dat.models %>% filter(!(ItemNum %in% excluded$ItemNum))
+}
+if (any(sapply(dat.human.mean$Sentence, function(x) {!(x %in% shared_sentences)}))) {
+  excluded = dat.human.mean %>% filter(!(Sentence %in% shared_sentences)) %>%
+    select(ItemNum, Sentence) %>% distinct()
+  warning('Not all human sentences are in the model data file. Excluding these sentences and their plausibility/active-passive pairs:\n') 
+  warning(paste(excluded$Sentence, '\n'))
+  dat.human.mean = dat.human.mean %>% filter(!(ItemNum %in% excluded$ItemNum))
+}
+```
+
+```{r}
+# use human data as a reference for item numbers
+sentence_itemnums = dat.human.mean %>%
+  select(ItemNum, Sentence) %>% distinct()
+dat.models= merge(sentence_itemnums, dat.models %>% select(-ItemNum))
+
+# prep human data
+dat.human.mean = dat.human.mean %>%
+  rename(Score=MeanScore)
+dat.human.mean$Metric = "human"
+dat.human.mean = dat.human.mean %>% select(-Plausibility)
+
+#get model plausibility assignment
+assignment_metric = dat.models$Metric[1]
+dat.models.plausibility.assignment = dat.models %>%
+  filter(Metric == assignment_metric) %>%
+  select(Sentence,ItemNum,Plausibility)
+dat.human.mean = merge(dat.human.mean,dat.models.plausibility.assignment,by=c("Sentence","ItemNum"))
+
+# combine
+dat.models = dat.models %>% select(colnames(dat.human.mean))
+dat = rbind(dat.models, dat.human.mean)
+```
+
+## Add sentence info
+
+```{r read data, echo=FALSE}
+# check that sentences match & exclude sentences where they don't
+if (any(sapply(dat$Sentence, function(x) {!(x %in% dat.sentence$Sentence)}))) {
+  shared_sentences = intersect(unique(dat$Sentence), unique(dat.sentence$Sentence))
+  excluded = dat %>% filter(!(Sentence %in% shared_sentences)) %>%
+    select(Sentence) %>% distinct()
+  warning('Not all human/model sentences are in the sentence data file. Excluding:\n') 
+  warning(paste(excluded$Sentence, '\n'))
+}
+
+# merge
+if ("ItemNum" %in% colnames(dat.sentence)) {
+  dat = merge(dat, dat.sentence %>% select(-ItemNum, -Plausibility), by=c("Sentence"))
+} else {
+  dat = merge(dat, dat.sentence %>% select(-Plausibility), by=c("Sentence"))
+}
+
+# check which sentences don't have a plausibility pair
+sentence_pairnum = dat %>%
+  group_by(ItemNum, TrialType, Voice, Metric) %>%
+  summarize(NumSentences = length(ItemNum)) %>%
+  ungroup()
+single_sentences = sentence_pairnum %>%
+  filter(NumSentences!=2) %>% 
+  select(ItemNum) %>%
+  distinct()
+
+# filter them out
+if (length(single_sentences$ItemNum)>0) {
+  excluded = dat %>%
+    filter(ItemNum %in% single_sentences$ItemNum)
+  dat = dat %>%
+    filter(!(ItemNum %in% single_sentences$ItemNum))
+  warning('Found sentences without a plausibility pair. Excluding:')
+  warning(paste(excluded$Sentence, '\n'))
+}
+```
+
+
+## Final checks
+```{r}
+# make sure that item numbers are the same everywhere
+#         & that the sentences are the same across all metrics
+item_sent_combos = dat %>%
+  group_by(Sentence) %>%
+  summarize(ItemCount=length(unique(ItemNum)),
+         SentenceCount=length(Sentence))
+if (any(sapply(item_sent_combos$ItemCount, function(x) {x!=1}))) {
+  print(item_sent_combos %>% filter(ItemCount!=1))
+  stop('Item number mismatch across metrics')
+}
+if (length(unique(item_sent_combos$SentenceCount))>1) {
+  correctNum = mode(item_sent_combos$SentenceCount)
+  print (item_sent_combos %>% filter(SentenceCount!=correctNum))
+  stop('Not all metrics have the same sentences')
+}
+
+print(paste(unique(dat$Metric)))
+```
+
+# Plausibility
+
+We need to define for which models a higher score for plausible sentences is desirable:
+
+1. HIGHER = MORE PLAUSIBLE
+    * (Ro)BERT(a) >> metric is sentence PLL
+    * GPT >> metric is sentence LL
+    * PPMI >> higher PMI indicates a plausible sentence
+    * Vector similarity
+    * TFit similarity (sum of vector similarities to prototype vector)
+    * SDM (sum of some vector similarities)
+2. LOWER = MORE PLAUSIBLE
+    * LSTM >> Surprisal
+
+
+```{r, echo=FALSE}
+lower_better = c("surprisal")
+lower_better_pat <- paste(lower_better, collapse = '|')
+
+# Add FinalNormScore for NormScores plotting in the same direction for all metrics (i.e., Plausible is more positive)
+dat = dat %>%
+  mutate(LowerBetter = ifelse(grepl(lower_better_pat, Metric),TRUE,FALSE)) %>%
+  mutate(FinalNormScore = ifelse(LowerBetter==TRUE, -NormScore+1, NormScore))
+```
+
+
+# Save final dataframes
+
+## Only include human scores from the final sentence set
+```{r}
+message(paste('num sentences in dat:'))
+message(paste(length(unique(dat$Sentence))))
+
+message(paste('num sentences in dat.human before and after matching with the main dataframe:'))
+message(paste(length(unique(dat.human$Sentence))))
+dat.human = dat.human %>%
+  filter(Sentence %in% dat$Sentence)
+message(paste(length(unique(dat.human$Sentence))))
+```
+
+## Save
+```{r}
+savedir <- 'clean_data'
+
+# main dataframe
+filename <- paste('clean', experiment, 'df.csv', sep='_')
+dat = dat %>% arrange(ItemNum,Metric,Voice,desc(Plausibility))
+write.csv(dat, paste(savedir,filename,sep="/"), row.names = FALSE)
+
+# sentence set
+if (experiment=='EventsAdapt') {
+  sentence_set = dat %>%
+    select(ItemNum, Sentence, Plausibility, Voice, TrialType, SynonymPair, NumSyn) %>% 
+    distinct() %>% arrange(ItemNum)
+} else {
+  sentence_set = dat %>%
+    select(ItemNum, Sentence, Plausibility, Voice) %>% 
+    distinct() %>% arrange(ItemNum)
+}
+filename <- paste('clean', experiment, 'SentenceSet.csv', sep='_')
+write.csv(sentence_set, paste(savedir,filename,sep="/"), row.names = FALSE)
+
+# human data
+filename <- paste('clean', experiment, 'human_dat.csv', sep='_')
+write.csv(dat.human %>% 
+            filter(Sentence %in% shared_sentences) %>%
+            arrange(ItemNum, desc(Plausibility)), 
+          paste(savedir,filename,sep="/"), row.names = FALSE)
+```

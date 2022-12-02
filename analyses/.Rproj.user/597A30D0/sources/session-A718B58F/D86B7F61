@@ -1,0 +1,26 @@
+{
+    "id": "D86B7F61",
+    "path": "~/Downloads/lm-event-knowledge-main/analyses/probing_model2plausibility.Rmd",
+    "project_path": "probing_model2plausibility.Rmd",
+    "type": "r_markdown",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1670010535147.0,
+    "source_on_save": false,
+    "relative_order": 2,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "92,16",
+        "scrollLine": "82"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1669936196,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1669936196,
+    "read_only": false,
+    "read_only_alternatives": []
+}

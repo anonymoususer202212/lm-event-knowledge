@@ -1,0 +1,241 @@
+---
+title: "Probing results"
+output: html_document #with html_notebook you get a printout of the notebook
+---
+
+# SETUP
+
+```{r setup, include=FALSE, echo=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls()) 
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(grid)
+library(gridExtra)
+library(operator.tools)
+library(lme4)
+library(lmerTest)
+library(cocor)
+library(patchwork)
+library(gtools)
+
+source('dataloader_utils.R') #includes normalizations, read_data functions
+source('stats_utils.R')
+
+# Suppress summarise info
+options(dplyr.summarise.inform = FALSE)
+```
+
+## Output dir
+```{r}
+path <- paste("results/")
+ifelse(!dir.exists(path), dir.create(path), FALSE)
+savedir <- paste(path,"Probing",sep='')
+ifelse(!dir.exists(savedir), dir.create(savedir), FALSE)
+```
+
+
+# READ DATA
+```{r}
+model2human_dir = "../probing/results/model2human"
+
+read_data <- function(directory, filename) {
+  if (!filename =="all_combined_kfold.csv"){
+    metadata = str_split(filename, "_")[[1]]
+    d = read.delim(paste(directory, filename, sep='/'), 
+                   header=FALSE, sep=',')
+    # stacking data from iterations
+    d = data.frame(d[1], stack(d[2:ncol(d)]))
+    d = d %>%
+      mutate(Model = metadata[[1]]) %>%
+      mutate(Model = ifelse(grepl("roberta", Model), "RoBERTa", Model)) %>%
+      mutate(Model = ifelse(grepl("bert", Model), "BERT", Model)) %>%
+      mutate(Model = ifelse(grepl("gpt2", Model), "GPT2-xl", Model)) %>%
+      mutate(Model = ifelse(grepl("gpt-j", Model), "GPT-J", Model))  %>%
+      mutate(Dataset = metadata[[2]]) %>%
+      mutate(VoiceType = metadata[[3]]) %>%
+      mutate(VoiceType = ifelse(grepl("EventsAdapt",Dataset),
+                                ifelse(length(str_split(VoiceType, "-")[[1]]) > 1,
+                                      paste0("TrainOn:",str_split(VoiceType, "-")[[1]][1],"-TestOn:",str_split(VoiceType, "-")[[1]][2]),
+                                VoiceType),
+                          VoiceType)) %>%
+      mutate(TrialType = metadata[[4]]) %>%
+      mutate(TrialType = str_replace(TrialType, ".csv", "")) %>%
+      mutate(TrialType = ifelse(grepl("EventsAdapt",Dataset),
+                                ifelse(length(str_split(TrialType, "-")[[1]]) > 1,
+                                       paste0("TrainOn:",str_split(TrialType, "-")[[1]][1],"-TestOn:",str_split(TrialType, "-")[[1]][2]),
+                                TrialType),
+                          TrialType)) %>%
+      dplyr::rename(Layer = V1) %>%
+      dplyr::rename(Accuracy = values)  %>%
+      dplyr::rename(Iteration = ind)  %>%
+      mutate(Iteration = str_replace(as.character(Iteration), "V", "")) %>%
+      mutate(Iteration = as.numeric(Iteration)-2) %>%
+      mutate(Plot = paste(Model, Dataset, VoiceType, TrialType, sep = " ")) %>%
+      mutate(Plot = str_replace(Plot, "normal normal", "")) %>%
+      mutate(Plot = ifelse(length(str_split(TrialType, "-")[[1]]) > 1, str_replace(Plot, "normal", "AI/AAN"), Plot))
+
+    #reorder columns
+    d <- d[, c("Dataset", "Model", "VoiceType", "TrialType", "Layer", "Iteration", "Accuracy", "Plot")]
+  }
+}
+```
+
+```{r}
+filenames = list.files(path=model2human_dir, pattern='*.csv')
+dat.models = do.call(rbind, lapply(filenames, function(x) read_data(model2human_dir, x)))
+
+dat = dat.models
+
+dat$Layer = as.factor(dat$Layer)
+dat$Model = factor(dat$Model, levels=c("RoBERTa","BERT", "GPT-J", "GPT2-xl"))
+```
+
+# STATS
+
+```{r}
+dat.DTFit = dat %>% filter(Dataset=="DTFit")
+
+m.DTFit = lm(Accuracy~Layer:Model, data=dat.DTFit)
+summary(m.DTFit)
+```
+```{r}
+breaks_fun <- function(x) {
+  if (max(x) > 40) {
+    breaks = c(seq(0, 50, 10))
+  } else {
+    breaks = c(seq(0, 25, 5))
+  }
+}
+```
+
+## All datasets
+```{r, fig.width=15, fig.height=8}
+plot_data = dat %>% filter(TrialType=="normal", VoiceType=="normal")
+plot_data$Layer = as.numeric(as.character(plot_data$Layer))
+
+plot.all = ggplot(data = plot_data,
+       mapping = aes(x=Layer, y=Accuracy, color=Dataset, group = Dataset))+
+  facet_grid(~Model, scales="free_x")+
+  geom_hline(yintercept=.33, linetype='dotted')+
+  geom_hline(yintercept=1, linetype='dotted')+
+  stat_summary(geom='line', fun='mean')+
+  stat_summary(geom='errorbar', fun.data='mean_se',
+               size = 0.2, width=0.1)+
+  theme_classic()+
+  scale_x_continuous(breaks = breaks_fun, limits = c(0, NA)) + 
+  scale_y_continuous(breaks=seq(0.3,1.2,0.1))
+plot.all
+
+savename <- "model2human_all_datasets.png"
+ggsave(paste(savedir,savename,sep="/"), width=20, height=8, units='cm', device='tiff', dpi=700)
+```
+
+## DTFit
+```{r}
+dataset = "DTFit"
+
+ggplot(data = dat %>% filter(Dataset==dataset),
+       mapping = aes(x=Layer, y=Accuracy, group=dataset))+
+  facet_wrap(~Plot, scales="free_x")+
+  geom_hline(yintercept=.33, linetype='dotted')+
+  geom_hline(yintercept=1, linetype='dotted')+
+  stat_summary(geom='line', fun='mean')+
+  stat_summary(geom='errorbar', fun.data='mean_se',
+               color = 'black', size = 0.5, width=0.1)+
+  theme_classic()#+
+  #scale_x_continuous(breaks = breaks_fun, limits = c(0, NA)) + 
+  #scale_y_continuous(breaks=seq(0.3,1.2,0.1))
+
+savename <- "model2human_DTFit.png"
+ggsave(paste(savedir,savename,sep="/"), width=16, height=8, units='cm')
+```
+
+## EventsRev
+```{r}
+dataset = "EventsRev"
+
+ggplot(data = dat %>% filter(Dataset==dataset),
+       mapping = aes(x=Layer, y=Accuracy, group=dataset))+
+  facet_grid(~Plot, scales="free_x")+
+  geom_hline(yintercept=.33, linetype='dotted')+
+  geom_hline(yintercept=1, linetype='dotted')+
+  stat_summary(geom='line', fun='mean')+
+  stat_summary(geom='errorbar', fun.data='mean_se',
+               color = 'black', size = 0.5, width=0.1)+
+  theme_classic()
+
+savename <- "model2human_EventsRev.png"
+ggsave(paste(savedir,savename,sep="/"), width=16, height=8, units='cm')
+```
+
+## EventsAdapt
+
+### Active Passive
+```{r, fig.width=15, fig.height=8}
+dataset = "EventsAdapt"
+plot_data = dat %>% filter(Dataset==dataset, TrialType=="normal")
+plot_data$Layer = as.numeric(as.character(plot_data$Layer))
+
+plot.voice = ggplot(data = plot_data,
+       mapping = aes(x=Layer, y=Accuracy, color=VoiceType, group=VoiceType))+
+  facet_grid(~Model, scales="free_x")+
+  geom_hline(yintercept=.33, linetype='dotted')+
+  geom_hline(yintercept=1, linetype='dotted')+
+  stat_summary(geom='line', fun='mean')+
+  stat_summary(geom='errorbar', fun.data='mean_se',
+               size = 0.2, width=0.1)+
+  theme_classic()+
+  scale_color_manual(values = c("all" = brewer.pal(12, "Paired")[[10]],
+                                "TrainOn:active-TestOn:active" = brewer.pal(12, "Paired")[[8]],
+                                "TrainOn:passive-TestOn:passive" = brewer.pal(12, "Paired")[[7]],
+                                "TrainOn:active-TestOn:passive" = brewer.pal(12, "Paired")[[6]],
+                                "TrainOn:passive-TestOn:active" = brewer.pal(12, "Paired")[[5]]
+                                ))+
+  scale_x_continuous(breaks = breaks_fun, limits = c(0, NA)) 
+  #scale_y_continuous(breaks=seq(0.2,1,0.1))
+plot.voice
+
+savename <- "model2human_EventsAdapt_active-passive.png"
+ggsave(paste(savedir,savename,sep="/"), width=20, height=8, units='cm', device='tiff', dpi=700)
+```
+
+### TrialTypes
+```{r, fig.width=15, fig.height=8}
+dataset = "EventsAdapt"
+plot_data = dat %>% filter(Dataset==dataset, VoiceType=="TrainOn:active-TestOn:active", !grepl('AAR', TrialType))
+plot_data$Layer = as.numeric(as.character(plot_data$Layer))
+
+plot.trialtype = ggplot(data = plot_data,
+       mapping = aes(x=Layer, y=Accuracy, color=TrialType, group=TrialType))+
+  facet_grid(~Model, scales="free_x")+
+  geom_hline(yintercept=.33, linetype='dotted')+
+  geom_hline(yintercept=1, linetype='dotted')+
+  stat_summary(geom='line', fun='mean')+
+  stat_summary(geom='errorbar', fun.data='mean_se',
+               size = 0.2, width=0.1)+
+  theme_classic()+
+  scale_x_continuous(breaks = breaks_fun, limits = c(0, NA))+
+  scale_color_manual(values = c("all" = brewer.pal(12, "Paired")[[10]],
+                                "TrainOn:AI-TestOn:AI" = brewer.pal(12, "Paired")[[2]],
+                                "TrainOn:AAN-TestOn:AAN" = brewer.pal(12, "Paired")[[1]],
+                                "TrainOn:AI-TestOn:AAN" = brewer.pal(12, "Paired")[[4]],
+                                "TrainOn:AAN-TestOn:AI" = brewer.pal(12, "Paired")[[3]]
+                                ))   
+
+plot.trialtype
+
+savename <- "model2human_EventsAdapt_AI-AAN.png"
+ggsave(paste(savedir,savename,sep="/"), width=20, height=8, units='cm', device='tiff', dpi=700)
+```
+
+```{r}
+main_plot <- plot.all / plot.trialtype / plot.voice +
+  plot_annotation(tag_levels = list(c('A', 'B', 'C'))) & 
+   theme(plot.tag.position = c(0, 0.98), plot.tag = element_text(face='bold', size=18))
+main_plot
+
+ggsave(paste(savedir,"multiclass_combined_plot.png",sep="/"), plot=main_plot, height=30, width=30, units='cm')
+```
